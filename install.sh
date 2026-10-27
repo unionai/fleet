@@ -210,6 +210,8 @@ preflight() {
 }
 
 confirm_existing_agent() {
+  local -a list_args=(list --namespace "$namespace" --output=json)
+  if [[ "$helm_version" == v3.* ]]; then list_args+=(--all); fi
   kube get namespace "$namespace" --ignore-not-found --output=json \
     > "$work_dir/agent-namespace.json" 2> "$work_dir/kube-error" \
     || fail "Cannot inspect namespace $namespace."
@@ -217,7 +219,7 @@ confirm_existing_agent() {
   jq -e --arg namespace "$namespace" 'type == "object" and .kind == "Namespace" and
     .metadata.name == $namespace' "$work_dir/agent-namespace.json" >/dev/null 2>&1 \
     || fail 'Kubernetes returned an invalid namespace response.'
-  HELM_KUBECONTEXT=$context helm list --namespace "$namespace" --all --output=json \
+  HELM_KUBECONTEXT=$context helm "${list_args[@]}" \
     > "$work_dir/releases.json" 2> "$work_dir/helm-error" \
     || fail 'Cannot inspect existing Helm releases.'
   jq -e 'type == "array" and all(.[]; .name | type == "string" and length > 0)' \

@@ -138,7 +138,13 @@ elif tool == "helm":
     elif args[0] == "list":
         if os.environ.get("HELM_KUBECONTEXT") != "test-context":
             sys.exit("Helm release lookup did not pin the confirmed context")
-        if args != ["list", "--namespace", "dataplane-agent", "--all", "--output=json"]:
+        version = options.get("helm_version", "v3.19.0+test")
+        if version.startswith("v4.") and "--all" in args:
+            sys.exit("unknown flag: --all")
+        expected = ["list", "--namespace", "dataplane-agent", "--output=json"]
+        if version.startswith("v3."):
+            expected.append("--all")
+        if args != expected:
             sys.exit("Helm lookup must include every release in the agent namespace")
         if options.get("helm_list_error"):
             sys.exit("PRIVATE-KEY-SENTINEL")

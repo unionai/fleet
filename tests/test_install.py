@@ -18,6 +18,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 BASH = os.environ.get("BASH_BIN", "/bin/bash")
+REAL_HELM = shutil.which("helm")
 KEY = base64.b64encode(b"control.example.test:client:CLIENT-SECRET-SENTINEL:test-org").decode()
 
 
@@ -124,7 +125,7 @@ class InstallerTests(unittest.TestCase):
         return [item["args"][-1].rsplit("/", 1)[-1] for item in calls if item["tool"] == "curl"]
 
     def test_fresh_install_on_helm_3_and_4(self):
-        for version in ("v3.19.0", "v4.2.4"):
+        for version in ("v3.19.0", "v4.2.4", "v4.3.1"):
             with self.subTest(version=version):
                 code, text, calls, root = self.run_installer({"helm_version": version})
                 self.assertEqual(code, 0, text)
@@ -236,10 +237,26 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse(any(item["tool"] in ("curl", "helm") and item["args"][0] != "version" for item in calls))
 
     def test_declined_existing_agent_makes_no_installation_changes(self):
-        code, text, calls, root = self.run_installer({"existing": True}, answers=("yes", "no"))
+        for version in ("v3.19.0", "v4.2.4", "v4.3.1"):
+            with self.subTest(version=version):
+                code, text, calls, root = self.run_installer(
+                    {"existing": True, "helm_version": version}, answers=("yes", "no"))
+                self.assertEqual(code, 0, text)
+                self.assertIn("not currently supported", text)
+                self.assert_inspection_only(calls, root)
+
+    @unittest.skipUnless(REAL_HELM, "real Helm CLI is not installed")
+    def test_lookup_flags_are_accepted_by_installed_helm(self):
+        version = subprocess.run([REAL_HELM, "version", "--short"], check=True,
+                                 capture_output=True, text=True, timeout=15).stdout.strip()
+        code, text, calls, root = self.run_installer(
+            {"existing": True, "helm_version": version}, answers=("yes", "no"))
         self.assertEqual(code, 0, text)
-        self.assertIn("not currently supported", text)
         self.assert_inspection_only(calls, root)
+        lookup = next(call["args"] for call in calls if call["tool"] == "helm" and call["args"][0] == "list")
+        result = subprocess.run([REAL_HELM, *lookup, "--help"], capture_output=True,
+                                text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_no_terminal_fails(self):
         code, text, _, _ = self.run_installer(tty=False)
