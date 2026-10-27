@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 root = Path(os.environ["FAKE_ROOT"])
 options = json.loads((root / "options.json").read_text())
@@ -21,9 +22,23 @@ def state(name, default=0):
     return int(path.read_text()) if path.exists() else default
 
 
+def set_state(name, value):
+    temporary = root / f"{name}.{os.getpid()}.tmp"
+    temporary.write_text(str(value))
+    temporary.replace(root / name)
+
+
+def wait_for(predicate):
+    deadline = time.monotonic() + 10
+    while not predicate():
+        if time.monotonic() >= deadline:
+            sys.exit("offline command coordination timed out")
+        time.sleep(0.002)
+
+
 def increment(name):
     value = state(name) + 1
-    (root / name).write_text(str(value))
+    set_state(name, value)
     return value
 
 
@@ -72,13 +87,22 @@ def lifecycle():
         if "health" in result:
             result["health"] = 1 if result["health"] == "CLUSTER_HEALTH_HEALTHY" else 2
             result["connectivity"] = 1
+    sequence = options.get("status_sequence", [])
+    if installed and sequence:
+        result.update(sequence[min(state("post-attempts") - 1, len(sequence) - 1)])
     return {"status": result}
 
 
 if tool == "date":
     print(state("clock", 1000))
 elif tool == "sleep":
-    (root / "clock").write_text(str(state("clock", 1000) + int(float(args[0]))))
+    if float(args[0]) == 10:
+        tick = increment("ticker-sleeps")
+        set_state(f"ticker-processes-{tick}.json", json.dumps({
+            "ticker": os.getppid(), "sleeper": os.getpid()}))
+        wait_for(lambda: state("helm-ticks") >= tick)
+    else:
+        set_state("clock", state("clock", 1000) + int(float(args[0])))
 elif tool == "kubectl":
     if args == ["config", "current-context"]:
         print("test-context")
@@ -119,7 +143,7 @@ elif tool == "kubectl":
                             if item["metadata"]["namespace"] == "dataplane-agent"]})
     elif args[:2] == ["get", "deployment"]:
         (root / "readiness-time").write_text(str(state("clock", 1000)))
-        if options.get("agent_not_ready"):
+        if options.get("agent_not_ready") or increment("readiness-checks") <= options.get("agent_ready_after", 0):
             sys.exit(1)
         emit({"metadata": {"generation": 1}, "spec": {"replicas": 1}, "status": {
             "observedGeneration": 1, "updatedReplicas": 1, "availableReplicas": 1, "replicas": 1}})
@@ -163,6 +187,15 @@ elif tool == "helm":
             sys.exit("values file is not private")
         if "FLYTE_API_KEY" in os.environ:
             sys.exit("API key was inherited by Helm")
+        (root / "helm-started").touch()
+        if options.get("helm_hold"):
+            wait_for(lambda: False)
+        started = state("clock", 1000)
+        for tick in range(1, options.get("helm_ticks", 0) + 1):
+            wait_for(lambda: state("ticker-sleeps") >= tick)
+            set_state("clock", started + tick * 10)
+            set_state("helm-ticks", tick)
+            wait_for(lambda: state("ticker-sleeps") > tick)
         if options.get("helm_failure"):
             print("PRIVATE-KEY-SENTINEL", file=sys.stderr)
             sys.exit(1)
@@ -177,6 +210,7 @@ elif tool == "curl":
     status = 200
     body = {}
     if url.endswith("/.well-known/oauth-authorization-server"):
+        set_state("clock", state("clock", 1000) + options.get("authentication_clock_jump", 0))
         body = {"token_endpoint": "https://control.example.test/auth/token"}
     elif url.endswith("/auth/token"):
         if "Authorization: Basic " not in config:
@@ -197,12 +231,19 @@ elif tool == "curl":
         if options.get("rpc_unauthenticated"):
             status, body = 401, {"code": "unauthenticated", "message": "ACCESS-TOKEN-SENTINEL"}
         elif method == "GetLifecycleStatus":
-            if options.get("status_outage") and (root / "installed").exists():
+            installed = (root / "installed").exists()
+            attempt = increment("post-attempts") if installed else 0
+            if attempt == 1:
+                set_state("post-start-time", state("clock", 1000))
+                set_state("clock", state("clock", 1000) + options.get("status_clock_jump", 0))
+            if installed and (options.get("status_outage") or attempt in options.get("status_failure_attempts", [])):
                 status, body = 503, {"code": "unavailable"}
             else:
                 body = lifecycle()
         elif method in ("StartAgentInstallation", "GetAgentInstallationInstructions"):
             count = increment("instruction-count")
+            if count == 1:
+                set_state("clock", state("clock", 1000) + options.get("instruction_clock_jump", 0))
             if count <= options.get("instructions_unavailable", 0):
                 status, body = 503, {"code": "unavailable"}
             elif options.get("instructions_aborted"):

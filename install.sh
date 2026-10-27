@@ -7,7 +7,9 @@ work_dir=''
 context=''
 stage='initialization'
 diagnose=false
+prepare_timeout=600
 wait_timeout=1800
+active_timeout=600
 cluster=''
 deadline=0
 token_expires=0
@@ -17,11 +19,122 @@ http_retried=false
 instructions_version=''
 namespace=dataplane-agent
 service=cloudidl.fleet.FleetService
+progress_phase=''
+progress_label=''
+progress_since=0
+progress_dot=0
+progress_summary=0
+progress_open=false
+progress_status=false
+observed_status=''
+observed_since=0
+status_unavailable=false
+helm_ticker_pid=''
 
-say() { printf '%s\n' "$*"; }
-fail() { printf 'ERROR [%s]: %s\n' "$stage" "$*" >&2; exit 1; }
+progress_close() {
+  if [[ "$progress_open" == true ]]; then printf '\n' >&4; progress_open=false; fi
+}
+
+say() { progress_close; printf '%s\n' "$*"; }
+fail() { progress_close; printf 'ERROR [%s]: %s\n' "$stage" "$*" >&2; exit 1; }
 now() { date +%s; }
 kube() { kubectl --context "$context" --request-timeout=15s "$@"; }
+
+duration() {
+  local seconds=$1
+  if ((seconds < 0)); then seconds=0; fi
+  if ((seconds < 60)); then printf '%ss' "$seconds"
+  elif ((seconds % 60 == 0)); then printf '%sm' "$((seconds / 60))"
+  else printf '%sm %ss' "$((seconds / 60))" "$((seconds % 60))"; fi
+}
+
+progress_render() {
+  local current=$1
+  progress_close
+  printf '%s (waiting %s' "$progress_label" "$(duration "$((current - progress_since))")"
+  if [[ "$progress_status" == true && -n "$observed_status" ]]; then
+    if [[ "$status_unavailable" == true ]]; then
+      printf '; last status change observed %s ago' "$(duration "$((current - observed_since))")"
+    else
+      printf '; no status change observed for %s' "$(duration "$((current - observed_since))")"
+    fi
+  fi
+  printf ')'
+  progress_open=true
+  progress_dot=$current
+  progress_summary=$current
+}
+
+progress_tick() {
+  local current
+  current=$(now)
+  if ((current - progress_dot >= 10)); then printf '.'; progress_dot=$current; fi
+  if ((current - progress_summary >= 60)); then progress_render "$current"; fi
+}
+
+progress_wait() {
+  local current
+  current=$(now)
+  if [[ "$progress_phase" != "$1" ]]; then
+    progress_phase=$1
+    progress_label=$2
+    progress_since=$current
+    progress_render "$current"
+  elif [[ "$progress_open" == false ]]; then progress_render "$current"
+  else progress_tick; fi
+}
+
+start_helm_progress() {
+  progress_status=false
+  progress_wait helm 'Installing the cluster agent'
+  (
+    trap - EXIT
+    trap 'if [[ -n "${!:-}" ]]; then kill "$!" 2>/dev/null || :; wait "$!" 2>/dev/null || :; fi; exit 0' INT TERM
+    while true; do
+      sleep 10 &
+      wait "$!" || exit 0
+      progress_tick
+    done
+  ) &
+  helm_ticker_pid=$!
+}
+
+stop_helm_progress() {
+  if [[ -n "$helm_ticker_pid" ]]; then
+    kill "$helm_ticker_pid" 2>/dev/null || :
+    wait "$helm_ticker_pid" 2>/dev/null || :
+    helm_ticker_pid=''
+  fi
+}
+
+observe_status() {
+  local summary
+  summary=$(jq -r '
+    def phase:
+      if . == null then "waiting"
+      elif .state == "LIFECYCLE_STATE_INSTALLING" or .state == 1 then "installing"
+      elif (.state == "LIFECYCLE_STATE_COMPLETED" or .state == 2) and
+        (.result == "LIFECYCLE_RESULT_SUCCESS" or .result == 1) then "installed"
+      elif (.state == "LIFECYCLE_STATE_COMPLETED" or .state == 2) and
+        (.result == "LIFECYCLE_RESULT_FAILURE" or .result == 2) then "failed"
+      else "not yet confirmed" end;
+    .status |
+    (.agentInstallation | phase) as $agent |
+    (.unionInstallation | phase) as $union |
+    (if .connectivity == "CLUSTER_CONNECTIVITY_CONNECTED" or .connectivity == 1 then "connected"
+      elif .connectivity == "CLUSTER_CONNECTIVITY_DISCONNECTED" or .connectivity == 2 then "disconnected"
+      else "not yet confirmed" end) as $connection |
+    (if .health == "CLUSTER_HEALTH_HEALTHY" or .health == 1 then "healthy"
+      elif .health == "CLUSTER_HEALTH_UNHEALTHY" or .health == 2 then "not healthy yet"
+      else "not yet reported" end) as $health |
+    "Cluster agent: \($agent); Union services: \($union); connection: \($connection); health: \($health)."
+  ' "$work_dir/status.json")
+  if [[ "$summary" != "$observed_status" ]]; then
+    observed_status=$summary
+    observed_since=$(now)
+    say "$summary"
+  fi
+}
 
 usage() {
   cat <<'USAGE'
@@ -31,7 +144,8 @@ Export FLYTE_API_KEY for the Union control plane and organization that already
 contain this Fleet cluster registration. An interactive terminal is required.
 
   --cluster NAME          Existing Fleet cluster name (required).
-  --wait-timeout SECONDS  Preparation and post-Helm wait limits (default: 1800).
+  --wait-timeout SECONDS  Override both preparation and post-Helm wait limits.
+                         Defaults: preparation 600s; post-Helm 1800s.
   --help                  Show this help.
 USAGE
 }
@@ -61,6 +175,8 @@ finish() {
   local result=$?
   trap - EXIT INT TERM
   set +e
+  stop_helm_progress
+  progress_close
   if [[ "$result" != 0 && "$diagnose" == true && -n "$work_dir" ]]; then diagnostics; fi
   if [[ -n "$work_dir" ]]; then rm -rf -- "$work_dir"; fi
   exit "$result"
@@ -69,7 +185,7 @@ finish() {
 remaining() {
   local seconds
   seconds=$((deadline - $(now)))
-  ((seconds > 0)) || fail "Timed out after $wait_timeout seconds."
+  ((seconds > 0)) || fail "Timed out after $active_timeout seconds."
   printf '%s' "$seconds"
 }
 
@@ -257,7 +373,7 @@ fetch_installation() {
       if rpc "$procedure" "$work_dir/instructions.json"; then break; fi
     fi
     [[ "$rpc_code" == unavailable ]] || rpc_failed "$procedure"
-    say 'Waiting for the control plane to prepare agent instructions...'
+    progress_wait instructions 'Waiting for the control plane to prepare agent instructions'
     pause
   done
   jq -e --arg version "$version" '.instructionsVersion == $version and
@@ -279,55 +395,101 @@ agent_ready() {
 }
 
 wait_for_union() {
-  local requested=false stable_since=0 current summary previous=''
+  local requested=false stable_since=0 current installation_announced=false
+  active_timeout=$wait_timeout
   deadline=$(($(now) + wait_timeout))
+  progress_status=true
   while true; do
     remaining >/dev/null
     if ! get_status; then
       case "$http_status:$rpc_code" in
         000:*|429:*|500:*|502:*|503:*|504:*|*:unavailable)
-          stable_since=0; say 'Waiting for lifecycle status to become available...'; pause; continue ;;
+          if ((stable_since > 0)); then
+            say 'Readiness could not be verified. The 60-second stability check will restart.'
+          fi
+          stable_since=0
+          if [[ "$status_unavailable" == false ]]; then
+            say 'Unable to check installation status. Retrying.'
+            if [[ -n "$observed_status" ]]; then say "Last reported status: $observed_status"; fi
+          fi
+          status_unavailable=true
+          progress_wait unavailable 'Waiting for installation status to become available'
+          pause; continue ;;
         *) rpc_failed GetLifecycleStatus ;;
       esac
     fi
-    if [[ "$http_retried" == true ]]; then stable_since=0; fi
+    if [[ "$status_unavailable" == true ]]; then
+      say 'Installation status checks are available again.'
+      status_unavailable=false
+    fi
+    if [[ "$http_retried" == true ]]; then
+      if ((stable_since > 0)); then
+        say 'A status check needed a retry. The 60-second stability check will restart.'
+        progress_phase=''
+      fi
+      stable_since=0
+    fi
     jq -e --arg version "$instructions_version" '.status.instructionsVersion == $version' "$work_dir/status.json" >/dev/null \
       || fail 'Agent instructions changed during installation. Rerun to fetch current instructions.'
     check_union_failure
     if phase_failed agentInstallation; then fail 'Agent installation failed; inspect its pod conditions and console status.'; fi
-    summary=$(jq -r '.status | "Agent: \(.agentInstallation.state // "pending") / \(.agentInstallation.result // "pending"); Union: \(.unionInstallation.state // "pending") / \(.unionInstallation.result // "pending"); \(.connectivity // "pending") / \(.health // "pending")"' "$work_dir/status.json")
-    if [[ "$summary" != "$previous" ]]; then say "$summary"; previous=$summary; fi
+    observe_status
     if phase_success agentInstallation && [[ "$requested" == false ]] && \
       jq -e '.status.unionInstallation == null' "$work_dir/status.json" >/dev/null; then
       stage='Union deployment'
-      say 'Agent connected. Starting Union deployment...'
+      say 'Cluster agent installation is confirmed. Starting Union deployment...'
       requested=true
       rpc ApplyDeployment "$work_dir/cluster.json" 1 || rpc_failed ApplyDeployment
     fi
     stage='post-flight'
+    if phase_success agentInstallation && phase_success unionInstallation; then
+      if [[ "$installation_announced" == false ]]; then
+        say 'The cluster agent and Union services are installed.'
+        installation_announced=true
+      fi
+    fi
     if phase_success agentInstallation && phase_success unionInstallation && \
       jq -e '.status | (.connectivity == "CLUSTER_CONNECTIVITY_CONNECTED" or .connectivity == 1) and
         (.health == "CLUSTER_HEALTH_HEALTHY" or .health == 1)' "$work_dir/status.json" >/dev/null && agent_ready; then
       current=$(now)
       remaining >/dev/null
-      if ((stable_since == 0)); then stable_since=$current; say 'Installation is healthy. Verifying 60 seconds of stability...'; fi
+      if ((stable_since == 0)); then
+        stable_since=$current
+        progress_phase=''
+        say 'Installation is healthy. Verifying 60 seconds of stability...'
+      fi
       if ((current - stable_since >= 60)); then
         say "SUCCESS: $organization/$cluster is installed, connected and healthy (context $context)."
         return
       fi
+      progress_wait stability 'Checking that the cluster stays healthy for 60 seconds'
     else
+      if ((stable_since > 0)); then say 'Readiness changed. The 60-second stability check will restart.'; fi
       stable_since=0
+      if ! phase_success agentInstallation; then
+        progress_wait agent 'Waiting for Union to confirm the cluster agent installation'
+      elif ! phase_success unionInstallation; then
+        progress_wait union 'Waiting for Union services to finish installing'
+      elif ! jq -e '.status.connectivity == "CLUSTER_CONNECTIVITY_CONNECTED" or .status.connectivity == 1' "$work_dir/status.json" >/dev/null; then
+        progress_wait connection 'Installation is complete. Waiting for the cluster to connect'
+      elif ! jq -e '.status.health == "CLUSTER_HEALTH_HEALTHY" or .status.health == 1' "$work_dir/status.json" >/dev/null; then
+        progress_wait health 'Installation is complete. Waiting for the cluster to report healthy'
+      else
+        progress_wait ready 'Installation is complete. Waiting for the cluster agent to become ready'
+      fi
     fi
     pause
   done
 }
 
 main() {
+  # Preserve progress line endings when timeout checks discard stdout.
+  exec 4>&1
   local tool decoded extra server helm_version
   while (($#)); do
     case "$1" in
       --cluster) (($# >= 2)) || fail '--cluster requires a name.'; cluster=$2; shift 2 ;;
-      --wait-timeout) (($# >= 2)) || fail '--wait-timeout requires seconds.'; wait_timeout=$2; shift 2 ;;
+      --wait-timeout) (($# >= 2)) || fail '--wait-timeout requires seconds.'; wait_timeout=$2; prepare_timeout=$2; shift 2 ;;
       --help|-h) usage; return ;;
       *) fail "Unknown argument: $1" ;;
     esac
@@ -363,20 +525,27 @@ main() {
   say "Kubernetes context: $context" >&3
   say "Kubernetes API server: $server" >&3
   confirm "Is context $context the one you want to install into?"
+  say 'Checking Kubernetes access and available nodes...'
   preflight
   confirm_existing_agent
-  deadline=$(($(now) + wait_timeout))
+  active_timeout=$prepare_timeout
+  deadline=$(($(now) + prepare_timeout))
   jq -n --arg org "$organization" --arg name "$cluster" '{clusterId: {organization: $org, name: $name}}' > "$work_dir/cluster.json"
+  say 'Authenticating with Union...'
   authenticate
   stage='agent instructions'
+  progress_wait instructions 'Waiting for the control plane to prepare agent instructions'
   fetch_installation
   stage='agent installation'
-  say 'Installing the cluster agent using the control-plane Helm command...'
+  start_helm_progress
   diagnose=true
   if ! (cd "$work_dir"; export HELM_KUBECONTEXT="$context"; bash -e ./agent-install.sh) \
     > "$work_dir/helm-output" 2>&1; then
+    stop_helm_progress
     fail 'The agent Helm command failed. Review agent diagnostics; no rollback was attempted.'
   fi
+  stop_helm_progress
+  say 'The cluster agent installation command finished. Waiting for confirmation from Union.'
   rm -f -- "$work_dir/values.yaml" "$work_dir/agent-install.sh" "$work_dir/helm-output"
   stage='agent connection'
   wait_for_union
