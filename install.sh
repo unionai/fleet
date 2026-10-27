@@ -233,7 +233,7 @@ confirm_existing_agent() {
     "$work_dir/workloads.json" >/dev/null 2>&1 || fail 'Kubernetes returned an invalid workload list.'
   if jq -e 'length > 0' "$work_dir/releases.json" >/dev/null || \
     jq -e '.items | length > 0' "$work_dir/workloads.json" >/dev/null; then
-    say 'Installing into a namespace that already contains an agent is not currently supported.'
+    say 'Installing into a namespace that already contains an agent is not currently supported.' >&3
     confirm "Existing resources were found in namespace $namespace. Is proceeding with this Union target intentional?"
   fi
 }
@@ -358,10 +358,10 @@ main() {
   server=$(kube config view --minify --output='jsonpath={.clusters[0].cluster.server}' 2> "$work_dir/kube-error") \
     || fail 'Cannot read the current Kubernetes API server.'
   [[ -n "$server" ]] || fail 'The current context has no Kubernetes API server.'
-  say "Union target: $organization/$cluster (https://$api_host)"
-  say "Kubernetes context: $context"
-  say "Kubernetes API server: $server"
   if ! { exec 3<> /dev/tty; } 2>/dev/null; then fail 'An interactive terminal is required for context confirmation.'; fi
+  say "Union target: $organization/$cluster (https://$api_host)" >&3
+  say "Kubernetes context: $context" >&3
+  say "Kubernetes API server: $server" >&3
   confirm "Is context $context the one you want to install into?"
   preflight
   confirm_existing_agent

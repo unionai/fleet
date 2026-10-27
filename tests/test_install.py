@@ -24,7 +24,7 @@ KEY = base64.b64encode(b"control.example.test:client:CLIENT-SECRET-SENTINEL:test
 
 class InstallerTests(unittest.TestCase):
     def run_installer(self, options=None, answers=("yes", "yes"), timeout=1800, tty=True,
-                      arguments=None, key=KEY, interrupt=False):
+                      arguments=None, key=KEY, interrupt=False, buffered_stdout=False):
         directory = tempfile.TemporaryDirectory(prefix="fleet-test-")
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
@@ -49,6 +49,25 @@ class InstallerTests(unittest.TestCase):
         if tty:
             pid, fd = pty.fork()
             if pid == 0:
+                if buffered_stdout:
+                    read_fd, write_fd = os.pipe()
+                    child = os.fork()
+                    if child == 0:
+                        os.dup2(write_fd, 1)
+                        os.close(read_fd)
+                        os.close(write_fd)
+                        os.execve(BASH, command, env)
+                    os.close(write_fd)
+                    # Delay forwarding stdout until exit to model a slow tee.
+                    _, child_status = os.waitpid(child, 0)
+                    while True:
+                        chunk = os.read(read_fd, 65536)
+                        if not chunk:
+                            break
+                        os.write(1, chunk)
+                    os.close(read_fd)
+                    child_code = os.waitstatus_to_exitcode(child_status)
+                    os._exit(child_code if child_code >= 0 else 128 - child_code)
                 os.execve(BASH, command, env)
             pending = list(answers)
             prompts = 0
@@ -244,6 +263,17 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual(code, 0, text)
                 self.assertIn("not currently supported", text)
                 self.assert_inspection_only(calls, root)
+
+    def test_confirmation_details_and_warning_precede_prompts_with_buffered_stdout(self):
+        code, text, calls, root = self.run_installer(
+            {"existing": True, "helm_version": "v4.3.1"}, answers=("yes", "no"), buffered_stdout=True)
+        self.assertEqual(code, 0, text)
+        markers = ("Union target:", "Kubernetes context:", "Kubernetes API server:",
+                   "Is context test-context", "Installing into a namespace that already contains an agent",
+                   "Existing resources were found", "Cancelled;")
+        positions = [text.index(marker) for marker in markers]
+        self.assertEqual(positions, sorted(positions), text)
+        self.assert_inspection_only(calls, root)
 
     @unittest.skipUnless(REAL_HELM, "real Helm CLI is not installed")
     def test_lookup_flags_are_accepted_by_installed_helm(self):
