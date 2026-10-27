@@ -100,8 +100,23 @@ elif tool == "kubectl":
             sys.exit(1)
         print("yes")
     elif args[:2] == ["get", "namespace"]:
+        if options.get("namespace_error"):
+            sys.exit("PRIVATE-KEY-SENTINEL")
+        if "namespace_response" in options:
+            emit(options["namespace_response"])
+            sys.exit(0)
         if not options.get("namespace_absent"):
-            emit({"metadata": {"name": "dataplane-agent"}})
+            emit({"kind": "Namespace", "metadata": {"name": "dataplane-agent"}})
+    elif args[:2] == ["get", "deployments.apps,daemonsets.apps,statefulsets.apps,pods"]:
+        if args[2:] != ["--namespace", "dataplane-agent", "--output=json"]:
+            sys.exit("workload lookup did not use the agent namespace")
+        if options.get("workload_list_error"):
+            sys.exit("PRIVATE-KEY-SENTINEL")
+        if "workload_response" in options:
+            emit(options["workload_response"])
+        else:
+            emit({"items": [item for item in options.get("workloads", [])
+                            if item["metadata"]["namespace"] == "dataplane-agent"]})
     elif args[:2] == ["get", "deployment"]:
         (root / "readiness-time").write_text(str(state("clock", 1000)))
         if options.get("agent_not_ready"):
@@ -123,7 +138,16 @@ elif tool == "helm":
     elif args[0] == "list":
         if os.environ.get("HELM_KUBECONTEXT") != "test-context":
             sys.exit("Helm release lookup did not pin the confirmed context")
-        emit([{"name": "dp-agent"}] if options.get("existing") else [])
+        if args != ["list", "--namespace", "dataplane-agent", "--all", "--output=json"]:
+            sys.exit("Helm lookup must include every release in the agent namespace")
+        if options.get("helm_list_error"):
+            sys.exit("PRIVATE-KEY-SENTINEL")
+        if "helm_response" in options:
+            emit(options["helm_response"])
+        else:
+            releases = options.get("releases", [{"name": "dp-agent", "namespace": "dataplane-agent"}]
+                                   if options.get("existing") else [])
+            emit([release for release in releases if release["namespace"] == "dataplane-agent"])
     elif args[:2] == ["upgrade", "--install"]:
         if os.environ.get("HELM_KUBECONTEXT") != "test-context":
             sys.exit("Helm install did not pin the confirmed context")

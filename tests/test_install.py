@@ -142,9 +142,92 @@ class InstallerTests(unittest.TestCase):
     def test_existing_release_is_confirmed_then_updated(self):
         code, text, calls, _ = self.run_installer({"existing": True})
         self.assertEqual(code, 0, text)
-        self.assertIn("Is updating it", text)
+        self.assertIn("not currently supported", text)
+        self.assertIn("namespace dataplane-agent", text)
+        self.assertEqual(text.count("[y/N]"), 2)
         self.assertIn("GetAgentInstallationInstructions", self.methods(calls))
         self.assertNotIn("StartAgentInstallation", self.methods(calls))
+
+    def assert_inspection_only(self, calls, root):
+        self.assertEqual(self.methods(calls), [])
+        self.assertFalse((root / "installed").exists())
+        self.assertFalse((root / "applied").exists())
+        for call in calls:
+            if call["tool"] == "helm":
+                self.assertIn(call["args"][0], ("version", "list"))
+            if call["tool"] == "kubectl":
+                if call["args"] == ["config", "current-context"]:
+                    continue
+                self.assertIn(call["args"][3], ("config", "get", "auth"))
+
+    def test_any_helm_release_requires_warning_and_confirmation(self):
+        for status in ("deployed", "failed", "pending-upgrade", "uninstalled"):
+            with self.subTest(status=status):
+                release = {"name": "previous-agent", "namespace": "dataplane-agent", "status": status}
+                code, text, calls, root = self.run_installer({"releases": [release]}, answers=("yes", "no"))
+                self.assertEqual(code, 0, text)
+                self.assertIn("not currently supported", text)
+                self.assertEqual(text.count("[y/N]"), 2)
+                self.assertIn("Cancelled", text)
+                self.assert_inspection_only(calls, root)
+
+    def test_workloads_without_helm_records_require_confirmation(self):
+        for kind in ("Pod", "Deployment", "DaemonSet", "StatefulSet"):
+            with self.subTest(kind=kind):
+                workload = {"kind": kind, "metadata": {"name": "previous-agent", "namespace": "dataplane-agent"},
+                            "spec": {"replicas": 0}, "status": {"phase": "Failed"}}
+                code, text, calls, root = self.run_installer({"workloads": [workload]}, answers=("yes", "no"))
+                self.assertEqual(code, 0, text)
+                self.assertIn("not currently supported", text)
+                self.assertEqual(text.count("[y/N]"), 2)
+                self.assert_inspection_only(calls, root)
+
+    def test_workload_only_installation_can_be_explicitly_confirmed(self):
+        workload = {"kind": "Deployment", "metadata": {"name": "previous-agent", "namespace": "dataplane-agent"}}
+        code, text, calls, root = self.run_installer({"workloads": [workload]})
+        self.assertEqual(code, 0, text)
+        self.assertIn("not currently supported", text)
+        self.assertIn("SUCCESS", text)
+        self.assertTrue((root / "installed").exists())
+        self.assertEqual(self.methods(calls).count("ApplyDeployment"), 1)
+
+    def test_empty_or_missing_namespace_needs_no_second_confirmation(self):
+        for options in ({}, {"namespace_absent": True}):
+            with self.subTest(options=options):
+                code, text, _, _ = self.run_installer(options, answers=("yes",))
+                self.assertEqual(code, 0, text)
+                self.assertIn("SUCCESS", text)
+                self.assertNotIn("not currently supported", text)
+                self.assertEqual(text.count("[y/N]"), 1)
+
+    def test_resources_in_another_namespace_do_not_trigger_warning(self):
+        options = {"releases": [{"name": "dp-agent", "namespace": "another-namespace"}],
+                   "workloads": [{"kind": "Deployment", "metadata": {
+                       "name": "dp-agent", "namespace": "another-namespace"}}]}
+        code, text, _, _ = self.run_installer(options, answers=("yes",))
+        self.assertEqual(code, 0, text)
+        self.assertIn("SUCCESS", text)
+        self.assertNotIn("not currently supported", text)
+        self.assertEqual(text.count("[y/N]"), 1)
+
+    def test_agent_inspection_errors_stop_before_authentication(self):
+        for option in ("namespace_error", "helm_list_error", "workload_list_error"):
+            with self.subTest(option=option):
+                code, text, calls, root = self.run_installer({option: True})
+                self.assertNotEqual(code, 0, text)
+                self.assertIn("Cannot inspect", text)
+                self.assert_inspection_only(calls, root)
+
+    def test_malformed_agent_inspection_stops_before_authentication(self):
+        for options in ({"namespace_response": None}, {"namespace_response": []},
+                        {"namespace_response": {"kind": "Namespace", "metadata": {"name": "wrong-namespace"}}},
+                        {"helm_response": {}}, {"helm_response": [{}]},
+                        {"workload_response": {"items": None}}, {"workload_response": {"items": [{}]}}):
+            with self.subTest(options=options):
+                code, text, calls, root = self.run_installer(options)
+                self.assertNotEqual(code, 0, text)
+                self.assertIn("invalid", text)
+                self.assert_inspection_only(calls, root)
 
     def test_declined_context_makes_no_installation_changes(self):
         code, text, calls, _ = self.run_installer(answers=("no",))
@@ -153,10 +236,10 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse(any(item["tool"] in ("curl", "helm") and item["args"][0] != "version" for item in calls))
 
     def test_declined_existing_agent_makes_no_installation_changes(self):
-        code, text, calls, _ = self.run_installer({"existing": True}, answers=("yes", "no"))
+        code, text, calls, root = self.run_installer({"existing": True}, answers=("yes", "no"))
         self.assertEqual(code, 0, text)
-        self.assertNotIn("StartAgentInstallation", self.methods(calls))
-        self.assertFalse(any(item["tool"] == "helm" and item["args"][0] == "upgrade" for item in calls))
+        self.assertIn("not currently supported", text)
+        self.assert_inspection_only(calls, root)
 
     def test_no_terminal_fails(self):
         code, text, _, _ = self.run_installer(tty=False)

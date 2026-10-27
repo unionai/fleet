@@ -209,6 +209,33 @@ preflight() {
   [[ "$denied" == false ]] || fail 'Required agent-install permissions are missing.'
 }
 
+confirm_existing_agent() {
+  kube get namespace "$namespace" --ignore-not-found --output=json \
+    > "$work_dir/agent-namespace.json" 2> "$work_dir/kube-error" \
+    || fail "Cannot inspect namespace $namespace."
+  if [[ ! -s "$work_dir/agent-namespace.json" ]]; then return; fi
+  jq -e --arg namespace "$namespace" 'type == "object" and .kind == "Namespace" and
+    .metadata.name == $namespace' "$work_dir/agent-namespace.json" >/dev/null 2>&1 \
+    || fail 'Kubernetes returned an invalid namespace response.'
+  HELM_KUBECONTEXT=$context helm list --namespace "$namespace" --all --output=json \
+    > "$work_dir/releases.json" 2> "$work_dir/helm-error" \
+    || fail 'Cannot inspect existing Helm releases.'
+  jq -e 'type == "array" and all(.[]; .name | type == "string" and length > 0)' \
+    "$work_dir/releases.json" >/dev/null 2>&1 || fail 'Helm returned an invalid release list.'
+  kube get deployments.apps,daemonsets.apps,statefulsets.apps,pods --namespace "$namespace" --output=json \
+    > "$work_dir/workloads.json" 2> "$work_dir/kube-error" \
+    || fail "Cannot inspect existing workloads in namespace $namespace."
+  jq -e --arg namespace "$namespace" 'type == "object" and (.items | type == "array") and
+    all(.items[]; .metadata.namespace == $namespace and
+      (.metadata.name | type == "string" and length > 0))' \
+    "$work_dir/workloads.json" >/dev/null 2>&1 || fail 'Kubernetes returned an invalid workload list.'
+  if jq -e 'length > 0' "$work_dir/releases.json" >/dev/null || \
+    jq -e '.items | length > 0' "$work_dir/workloads.json" >/dev/null; then
+    say 'Installing into a namespace that already contains an agent is not currently supported.'
+    confirm "Existing resources were found in namespace $namespace. Is proceeding with this Union target intentional?"
+  fi
+}
+
 fetch_installation() {
   local procedure version agent_failed=false
   get_status || rpc_failed GetLifecycleStatus
@@ -335,12 +362,7 @@ main() {
   if ! { exec 3<> /dev/tty; } 2>/dev/null; then fail 'An interactive terminal is required for context confirmation.'; fi
   confirm "Is context $context the one you want to install into?"
   preflight
-  HELM_KUBECONTEXT=$context helm list --namespace "$namespace" --all --filter '^dp-agent$' --output=json \
-    > "$work_dir/releases.json" 2> "$work_dir/helm-error" || fail 'Cannot inspect existing agent Helm releases.'
-  jq -e 'type == "array"' "$work_dir/releases.json" >/dev/null || fail 'Helm returned an invalid release list.'
-  if jq -e 'length > 0' "$work_dir/releases.json" >/dev/null; then
-    confirm 'An existing dp-agent release was found. Is updating it with this Union target intentional?'
-  fi
+  confirm_existing_agent
   deadline=$(($(now) + wait_timeout))
   jq -n --arg org "$organization" --arg name "$cluster" '{clusterId: {organization: $org, name: $name}}' > "$work_dir/cluster.json"
   authenticate

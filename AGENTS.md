@@ -28,7 +28,11 @@ public repository. Use synthetic hosts and credentials in test fixtures.
   cluster. Registration and infrastructure provisioning are outside this script.
 - Confirm the current Kubernetes context before installation. Pin subsequent
   Kubernetes and Helm operations to that confirmed context.
-- Require another confirmation before updating an existing agent release.
+- In the fixed dataplane-agent namespace, any Helm release, Pod, Deployment,
+  DaemonSet or StatefulSet requires an unsupported-action warning and another
+  confirmation before proceeding, regardless of its registration or readiness.
+  An empty namespace or configuration/Secrets alone do not require this warning.
+  Failed or malformed inspection results must stop installation.
 - Execute the API-provided helm_command with its values.yaml in a private
   temporary directory. Do not reconstruct the command, parse chart versions,
   or introduce independent chart/version defaults.
