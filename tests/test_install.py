@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the real installer with a controlling terminal and offline doubles."""
 
-import base64
 import errno
 import json
 import os
@@ -11,15 +10,13 @@ import select
 import shutil
 import signal
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
 
-ROOT = Path(__file__).resolve().parents[1]
-BASH = os.environ.get("BASH_BIN", "/bin/bash")
+from installer_harness import BASH, KEY, ROOT, fixture_environment
+
 REAL_HELM = shutil.which("helm")
-KEY = base64.b64encode(b"control.example.test:client:CLIENT-SECRET-SENTINEL:test-org").decode()
 
 
 class InstallerTests(unittest.TestCase):
@@ -28,21 +25,7 @@ class InstallerTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory(prefix="fleet-test-")
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
-        (root / "bin").mkdir()
-        (root / "tmp").mkdir()
-        (root / "options.json").write_text(json.dumps(options or {}))
-        for tool in ("curl", "kubectl", "helm", "date", "sleep"):
-            (root / "bin" / tool).symlink_to(ROOT / "tests/fake_command.py")
-        (root / "bin" / "python3").symlink_to(sys.executable)
-        if (options or {}).get("missing_tool"):
-            for tool in ("bash", "jq", "base64", "tr", "mktemp", "cp", "rm"):
-                if tool != options["missing_tool"]:
-                    (root / "bin" / tool).symlink_to(shutil.which(tool))
-            search_path = str(root / "bin")
-        else:
-            search_path = f"{root / 'bin'}:{os.environ['PATH']}"
-        env = {**os.environ, "PATH": search_path,
-               "FAKE_ROOT": str(root), "FLYTE_API_KEY": key, "TMPDIR": str(root / "tmp")}
+        env = fixture_environment(root, options, key)
         default_arguments = ["--cluster", "test-cluster"]
         if timeout is not None:
             default_arguments += ["--wait-timeout", str(timeout)]

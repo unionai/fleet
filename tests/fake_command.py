@@ -11,6 +11,7 @@ root = Path(os.environ["FAKE_ROOT"])
 options = json.loads((root / "options.json").read_text())
 tool = Path(sys.argv[0]).name
 args = sys.argv[1:]
+speed = float(os.environ["FAKE_SPEED"]) if "FAKE_SPEED" in os.environ else None
 with (root / "calls.jsonl").open("a") as output:
     output.write(json.dumps({"tool": tool, "args": args,
                              "context": os.environ.get("HELM_KUBECONTEXT"),
@@ -29,11 +30,16 @@ def set_state(name, value):
 
 
 def wait_for(predicate):
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 10 + (10 / speed if speed is not None else 0)
     while not predicate():
         if time.monotonic() >= deadline:
             sys.exit("offline command coordination timed out")
         time.sleep(0.002)
+
+
+def pace(seconds):
+    if speed is not None:
+        time.sleep(seconds / speed)
 
 
 def increment(name):
@@ -102,6 +108,7 @@ elif tool == "sleep":
             "ticker": os.getppid(), "sleeper": os.getpid()}))
         wait_for(lambda: state("helm-ticks") >= tick)
     else:
+        pace(float(args[0]))
         set_state("clock", state("clock", 1000) + int(float(args[0])))
 elif tool == "kubectl":
     if args == ["config", "current-context"]:
@@ -193,9 +200,12 @@ elif tool == "helm":
         started = state("clock", 1000)
         for tick in range(1, options.get("helm_ticks", 0) + 1):
             wait_for(lambda: state("ticker-sleeps") >= tick)
+            pace(10)
             set_state("clock", started + tick * 10)
             set_state("helm-ticks", tick)
             wait_for(lambda: state("ticker-sleeps") > tick)
+        if options.get("helm_hold_after_ticks"):
+            wait_for(lambda: False)
         if options.get("helm_failure"):
             print("PRIVATE-KEY-SENTINEL", file=sys.stderr)
             sys.exit(1)
