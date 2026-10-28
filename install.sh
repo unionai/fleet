@@ -22,17 +22,38 @@ service=cloudidl.fleet.FleetService
 progress_phase=''
 progress_label=''
 progress_since=0
-progress_dot=0
-progress_summary=0
 progress_open=false
-progress_status=false
+progress_live=false
+progress_cursor_hidden=false
+progress_columns=0
+progress_ticker_pid=''
 observed_status=''
-observed_since=0
 status_unavailable=false
-helm_ticker_pid=''
+remaining_seconds=0
+
+progress_restore_cursor() {
+  if [[ "$progress_cursor_hidden" == true ]]; then
+    printf '\033[?25h' >&4
+    progress_cursor_hidden=false
+  fi
+}
 
 progress_close() {
-  if [[ "$progress_open" == true ]]; then printf '\n' >&4; progress_open=false; fi
+  if [[ "$progress_open" == false ]]; then progress_restore_cursor; return; fi
+  if [[ -n "$progress_ticker_pid" ]]; then
+    kill "$progress_ticker_pid" 2>/dev/null || :
+    wait "$progress_ticker_pid" 2>/dev/null || :
+    progress_ticker_pid=''
+  fi
+  if [[ "$progress_live" == true ]]; then
+    progress_render "$(now)" true
+    if [[ "$progress_live" == true ]]; then printf '\n' >&4; fi
+  else
+    printf '[%s] %s\n' "$(duration "$(($(now) - progress_since))")" "$progress_label" >&4
+  fi
+  progress_open=false
+  progress_phase=''
+  progress_restore_cursor
 }
 
 say() { progress_close; printf '%s\n' "$*"; }
@@ -44,67 +65,80 @@ duration() {
   local seconds=$1
   if ((seconds < 0)); then seconds=0; fi
   if ((seconds < 60)); then printf '%ss' "$seconds"
-  elif ((seconds % 60 == 0)); then printf '%sm' "$((seconds / 60))"
-  else printf '%sm %ss' "$((seconds / 60))" "$((seconds % 60))"; fi
+  else printf '%sm%ss' "$((seconds / 60))" "$((seconds % 60))"; fi
+}
+
+progress_width() {
+  local size rows columns extra
+  [[ -t 4 && "${TERM:-}" != dumb ]] || return 1
+  size=$(stty size <&4 2>/dev/null) || return 1
+  read -r rows columns extra <<< "$size"
+  [[ "$rows" =~ ^[0-9]+$ && "$columns" =~ ^[1-9][0-9]{0,5}$ && -z "$extra" ]] || return 1
+  progress_columns=$columns
 }
 
 progress_render() {
-  local current=$1
-  progress_close
-  printf '%s (waiting %s' "$progress_label" "$(duration "$((current - progress_since))")"
-  if [[ "$progress_status" == true && -n "$observed_status" ]]; then
-    if [[ "$status_unavailable" == true ]]; then
-      printf '; last status change observed %s ago' "$(duration "$((current - observed_since))")"
-    else
-      printf '; no status change observed for %s' "$(duration "$((current - observed_since))")"
+  local current=$1 final=${2:-false} elapsed prefix label available dots padding
+  [[ "$progress_live" == true ]] || return 0
+  elapsed=$((current - progress_since))
+  if ((elapsed < 0)); then elapsed=0; fi
+  prefix="[$(duration "$elapsed")] "
+  if ! progress_width || ((progress_columns < ${#prefix} + 6)); then
+    if [[ "$final" == true ]]; then
+      printf '\r\033[J[%s] %s\n' "$(duration "$elapsed")" "$progress_label" >&4
+      progress_live=false
     fi
+    return
   fi
-  printf ')'
-  progress_open=true
-  progress_dot=$current
-  progress_summary=$current
+  label=$progress_label
+  available=$((progress_columns - ${#prefix} - 2))
+  if ((${#label} > available)); then label="${label:0:available-3}..."; fi
+  available=$((progress_columns - ${#prefix} - ${#label} - 1))
+  dots=$((elapsed / 10 % (available + 1)))
+  printf -v padding '%*s' "$dots" ''
+  # Column zero lets the next redraw clear a wrapped tail after resizing.
+  printf '\r\033[J%s%s%s\r' "$prefix" "$label" "${padding// /.}" >&4
 }
 
-progress_tick() {
-  local current
-  current=$(now)
-  if ((current - progress_dot >= 10)); then printf '.'; progress_dot=$current; fi
-  if ((current - progress_summary >= 60)); then progress_render "$current"; fi
+progress_renderer_finish() {
+  trap - EXIT
+  trap '' INT TERM HUP
+  if [[ -n "$sleeper" ]]; then
+    kill "$sleeper" 2>/dev/null || :
+    wait "$sleeper" 2>/dev/null || :
+  fi
 }
 
 progress_wait() {
-  local current
-  current=$(now)
-  if [[ "$progress_phase" != "$1" ]]; then
-    progress_phase=$1
-    progress_label=$2
-    progress_since=$current
-    progress_render "$current"
-  elif [[ "$progress_open" == false ]]; then progress_render "$current"
-  else progress_tick; fi
-}
-
-start_helm_progress() {
-  progress_status=false
-  progress_wait helm 'Installing the cluster agent'
+  if [[ "$progress_open" == true && "$progress_phase" == "$1" ]]; then return; fi
+  progress_close
+  progress_phase=$1
+  progress_label=$2
+  progress_since=$(now)
+  progress_open=true
+  progress_live=false
+  if ! progress_width || ((progress_columns < 11)); then
+    printf '[0s] %s\n' "$progress_label" >&4
+    return
+  fi
+  progress_live=true
+  progress_cursor_hidden=true
+  printf '\033[?25l' >&4
+  progress_render "$progress_since"
   (
+    sleeper=''
     trap - EXIT
-    trap 'if [[ -n "${!:-}" ]]; then kill "$!" 2>/dev/null || :; wait "$!" 2>/dev/null || :; fi; exit 0' INT TERM
+    trap progress_renderer_finish EXIT
+    trap 'exit 0' INT TERM HUP
     while true; do
-      sleep 10 &
-      wait "$!" || exit 0
-      progress_tick
+      sleep 1 2>/dev/null &
+      sleeper=$!
+      wait "$sleeper" || exit 0
+      sleeper=''
+      progress_render "$(now)"
     done
   ) &
-  helm_ticker_pid=$!
-}
-
-stop_helm_progress() {
-  if [[ -n "$helm_ticker_pid" ]]; then
-    kill "$helm_ticker_pid" 2>/dev/null || :
-    wait "$helm_ticker_pid" 2>/dev/null || :
-    helm_ticker_pid=''
-  fi
+  progress_ticker_pid=$!
 }
 
 observe_status() {
@@ -131,7 +165,6 @@ observe_status() {
   ' "$work_dir/status.json")
   if [[ "$summary" != "$observed_status" ]]; then
     observed_status=$summary
-    observed_since=$(now)
     say "$summary"
   fi
 }
@@ -152,6 +185,7 @@ USAGE
 
 confirm() {
   local answer
+  progress_close
   printf '%s [y/N] ' "$1" >&3
   IFS= read -r answer <&3 || fail 'Could not read confirmation from the terminal.'
   case "$answer" in y|Y|yes|YES) ;; *) say 'Cancelled; no installation changes made.'; exit 0 ;; esac
@@ -175,24 +209,22 @@ finish() {
   local result=$?
   trap - EXIT INT TERM
   set +e
-  stop_helm_progress
   progress_close
+  progress_restore_cursor
   if [[ "$result" != 0 && "$diagnose" == true && -n "$work_dir" ]]; then diagnostics; fi
   if [[ -n "$work_dir" ]]; then rm -rf -- "$work_dir"; fi
   exit "$result"
 }
 
 remaining() {
-  local seconds
-  seconds=$((deadline - $(now)))
-  ((seconds > 0)) || fail "Timed out after $active_timeout seconds."
-  printf '%s' "$seconds"
+  remaining_seconds=$((deadline - $(now)))
+  ((remaining_seconds > 0)) || fail "Timed out after $active_timeout seconds."
 }
 
 pause() {
   local seconds
-  remaining >/dev/null
-  seconds=$(remaining)
+  remaining
+  seconds=$remaining_seconds
   if ((seconds > 5)); then seconds=5; fi
   sleep "$seconds"
 }
@@ -203,8 +235,8 @@ http() {
   local -a args
   http_retried=false
   for ((attempt=1; attempt<=retries; attempt++)); do
-    remaining >/dev/null
-    seconds=$(remaining)
+    remaining
+    seconds=$remaining_seconds
     if ((seconds > 30)); then seconds=30; fi
     args=(--silent --proto '=https' --connect-timeout 10 --max-time "$seconds"
       --request "$method" --output "$work_dir/response.json" --write-out '%{http_code}')
@@ -398,7 +430,6 @@ wait_for_union() {
   local requested=false stable_since=0 current installation_announced=false
   active_timeout=$wait_timeout
   deadline=$(($(now) + wait_timeout))
-  progress_status=true
   while true; do
     remaining >/dev/null
     if ! get_status; then
@@ -425,7 +456,6 @@ wait_for_union() {
     if [[ "$http_retried" == true ]]; then
       if ((stable_since > 0)); then
         say 'A status check needed a retry. The 60-second stability check will restart.'
-        progress_phase=''
       fi
       stable_since=0
     fi
@@ -455,7 +485,6 @@ wait_for_union() {
       remaining >/dev/null
       if ((stable_since == 0)); then
         stable_since=$current
-        progress_phase=''
         say 'Installation is healthy. Verifying 60 seconds of stability...'
       fi
       if ((current - stable_since >= 60)); then
@@ -483,7 +512,7 @@ wait_for_union() {
 }
 
 main() {
-  # Preserve progress line endings when timeout checks discard stdout.
+  # Progress output stays on stdout even when callers redirect their own output.
   exec 4>&1
   local tool decoded extra server helm_version
   while (($#)); do
@@ -537,14 +566,12 @@ main() {
   progress_wait instructions 'Waiting for the control plane to prepare agent instructions'
   fetch_installation
   stage='agent installation'
-  start_helm_progress
+  progress_wait helm 'Installing the cluster agent'
   diagnose=true
   if ! (cd "$work_dir"; export HELM_KUBECONTEXT="$context"; bash -e ./agent-install.sh) \
     > "$work_dir/helm-output" 2>&1; then
-    stop_helm_progress
     fail 'The agent Helm command failed. Review agent diagnostics; no rollback was attempted.'
   fi
-  stop_helm_progress
   say 'The cluster agent installation command finished. Waiting for confirmation from Union.'
   rm -f -- "$work_dir/values.yaml" "$work_dir/agent-install.sh" "$work_dir/helm-output"
   stage='agent connection'

@@ -48,6 +48,35 @@ def increment(name):
     return value
 
 
+def active_renderer():
+    renderer = state("active-renderer")
+    if renderer:
+        try:
+            os.kill(renderer, 0)
+            return renderer
+        except ProcessLookupError:
+            pass
+    return None
+
+
+def advance(seconds):
+    """Only operation waits advance time; renderer sleeps observe it."""
+    if os.environ.get("FAKE_REDRAW") != "1":
+        pace(seconds)
+        set_state("clock", state("clock", 1000) + seconds)
+        return
+    wait_for(active_renderer)
+    renderer = active_renderer()
+    steps = [1] * seconds if speed is not None or options.get("render_each_second") else [seconds]
+    for step in steps:
+        current = state("clock", 1000)
+        wait_for(lambda: state(f"renderer-{renderer}") >= current)
+        pace(step)
+        set_state("clock", current + step)
+        if step:
+            wait_for(lambda: state(f"renderer-{renderer}") >= current + step)
+
+
 def emit(value):
     print(json.dumps(value))
 
@@ -102,14 +131,19 @@ def lifecycle():
 if tool == "date":
     print(state("clock", 1000))
 elif tool == "sleep":
-    if float(args[0]) == 10:
-        tick = increment("ticker-sleeps")
-        set_state(f"ticker-processes-{tick}.json", json.dumps({
-            "ticker": os.getppid(), "sleeper": os.getpid()}))
-        wait_for(lambda: state("helm-ticks") >= tick)
+    installer = int(os.environ.get("FAKE_INSTALLER_PID", "0"))
+    if installer and os.getppid() != installer:
+        renderer = os.getppid()
+        current = state("clock", 1000)
+        set_state(f"ticker-processes-{os.getpid()}.json", json.dumps({
+            "ticker": renderer, "sleeper": os.getpid()}))
+        set_state(f"renderer-{renderer}", current)
+        set_state("active-renderer", renderer)
+        wait_for(lambda: state("clock", 1000) > current)
     else:
-        pace(float(args[0]))
-        set_state("clock", state("clock", 1000) + int(float(args[0])))
+        advance(int(float(args[0])))
+elif tool == "stty":
+    sys.exit(1)
 elif tool == "kubectl":
     if args == ["config", "current-context"]:
         print("test-context")
@@ -198,13 +232,10 @@ elif tool == "helm":
         if options.get("helm_hold"):
             wait_for(lambda: False)
         started = state("clock", 1000)
-        for tick in range(1, options.get("helm_ticks", 0) + 1):
-            wait_for(lambda: state("ticker-sleeps") >= tick)
-            pace(10)
-            set_state("clock", started + tick * 10)
-            set_state("helm-ticks", tick)
-            wait_for(lambda: state("ticker-sleeps") > tick)
+        set_state("helm-start-time", started)
+        advance(options.get("helm_seconds", options.get("helm_ticks", 0) * 10))
         if options.get("helm_hold_after_ticks"):
+            (root / "helm-paused").touch()
             wait_for(lambda: False)
         if options.get("helm_failure"):
             print("PRIVATE-KEY-SENTINEL", file=sys.stderr)
@@ -254,6 +285,7 @@ elif tool == "curl":
             count = increment("instruction-count")
             if count == 1:
                 set_state("clock", state("clock", 1000) + options.get("instruction_clock_jump", 0))
+                advance(options.get("instructions_delay", 0))
             if count <= options.get("instructions_unavailable", 0):
                 status, body = 503, {"code": "unavailable"}
             elif options.get("instructions_aborted"):

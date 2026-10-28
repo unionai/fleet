@@ -21,7 +21,7 @@ from installer_harness import BASH, ROOT, fixture_environment
 SCENARIOS = {
     "success": "Successful install and stability verification",
     "existing-agent": "Existing-resource warning and second confirmation",
-    "slow": "Delayed instructions, minute summaries, and changing readiness",
+    "slow": "Delayed instructions, elapsed timers, and changing readiness",
     "helm-failure": "Agent Helm failure with diagnostics",
     "union-failure": "Union deployment failure after agent installation",
     "timeout": "Unchanged status and a 75-second simulated timeout",
@@ -90,6 +90,9 @@ def run_terminal(command, env, *, automatic=False, source=None, interrupt_root=N
                 os.close(source_write)
                 os.dup2(source_read, 0)
                 os.close(source_read)
+            if "FAKE_ROOT" in env:
+                env = {**env, "FAKE_INSTALLER_PID": str(os.getpid()),
+                       "FAKE_REDRAW": "1" if env.get("TERM") != "dumb" else "0"}
             os.execve(command[0], command, env)
         except Exception as exc:
             print(f"Cannot start preview: {exc}", file=sys.stderr, flush=True)
@@ -143,8 +146,7 @@ def run_terminal(command, env, *, automatic=False, source=None, interrupt_root=N
                     break
                 write_all(master, chunk)
             if interrupt_root is not None and not interrupted:
-                # The third sleep starts after the second progress tick is rendered.
-                if (interrupt_root / "ticker-processes-3.json").exists():
+                if (interrupt_root / "helm-paused").exists():
                     signal_group(pid, signal.SIGINT)
                     interrupted = True
         _, status = os.waitpid(pid, 0)

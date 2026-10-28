@@ -2,6 +2,7 @@
 """Exercise the real installer with a controlling terminal and offline doubles."""
 
 import errno
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -9,23 +10,41 @@ import pty
 import select
 import shutil
 import signal
+import struct
 import subprocess
 import tempfile
+import termios
 import time
 import unittest
 
-from installer_harness import BASH, KEY, ROOT, fixture_environment
+from installer_harness import (BASH, KEY, ROOT, assert_cursor_visibility, fixture_environment,
+                               progress_frames, terminal_transcript)
 
 REAL_HELM = shutil.which("helm")
 
 
+class DurationTests(unittest.TestCase):
+    def test_compact_duration_boundaries_always_keep_seconds(self):
+        definitions = (ROOT / "install.sh").read_text().rsplit('\nmain "$@"', 1)[0]
+        result = subprocess.run(
+            [BASH, "-c", definitions + '\nfor value in "$@"; do duration "$value"; printf "\\n"; done',
+             "duration", "-1", "0", "59", "60", "64", "3601"],
+            capture_output=True, text=True, timeout=5, check=True)
+        self.assertEqual(result.stdout.splitlines(), ["0s", "0s", "59s", "1m0s", "1m4s", "60m1s"])
+
+
 class InstallerTests(unittest.TestCase):
     def run_installer(self, options=None, answers=("yes", "yes"), timeout=None, tty=True,
-                      arguments=None, key=KEY, interrupt=False, buffered_stdout=False, piped_script=False):
+                      arguments=None, key=KEY, interrupt=False, buffered_stdout=False, piped_script=False,
+                      columns=120, action=None):
         directory = tempfile.TemporaryDirectory(prefix="fleet-test-")
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
         env = fixture_environment(root, options, key)
+        env["FAKE_REDRAW"] = "1" if (tty and not buffered_stdout and columns >= 11 and
+                                            env["TERM"] != "dumb" and
+                                            not (options or {}).get("stty_error") and
+                                            (options or {}).get("missing_tool") != "stty") else "0"
         default_arguments = ["--cluster", "test-cluster"]
         if timeout is not None:
             default_arguments += ["--wait-timeout", str(timeout)]
@@ -37,6 +56,7 @@ class InstallerTests(unittest.TestCase):
                 source_read, source_write = os.pipe()
             pid, fd = pty.fork()
             if pid == 0:
+                fcntl.ioctl(1, termios.TIOCSWINSZ, struct.pack("HHHH", 24, columns, 0, 0))
                 if piped_script:
                     os.close(source_write)
                     os.dup2(source_read, 0)
@@ -48,6 +68,7 @@ class InstallerTests(unittest.TestCase):
                         os.dup2(write_fd, 1)
                         os.close(read_fd)
                         os.close(write_fd)
+                        env["FAKE_INSTALLER_PID"] = str(os.getpid())
                         os.execve(BASH, command, env)
                     os.close(write_fd)
                     # Delay forwarding stdout until exit to model a slow tee.
@@ -60,6 +81,7 @@ class InstallerTests(unittest.TestCase):
                     os.close(read_fd)
                     child_code = os.waitstatus_to_exitcode(child_status)
                     os._exit(child_code if child_code >= 0 else 128 - child_code)
+                env["FAKE_INSTALLER_PID"] = str(os.getpid())
                 os.execve(BASH, command, env)
             if piped_script:
                 os.close(source_read)
@@ -87,8 +109,10 @@ class InstallerTests(unittest.TestCase):
                         if count > prompts and pending:
                             os.write(fd, (pending.pop(0) + "\n").encode())
                             prompts = count
+                    if action:
+                        action(bytes(output), fd, root)
                     if not sent_signal:
-                        if interrupt in ("helm-term", "helm-int") and (root / "helm-started").exists() and (root / "ticker-processes-1.json").exists():
+                        if interrupt in ("helm-term", "helm-int") and (root / "helm-started").exists() and list(root.glob("ticker-processes-*.json")):
                             os.killpg(pid, signal.SIGINT if interrupt == "helm-int" else signal.SIGTERM)
                             sent_signal = True
                         elif interrupt is True and (root / "installed").exists():
@@ -126,16 +150,17 @@ class InstallerTests(unittest.TestCase):
                                      stderr=subprocess.STDOUT, start_new_session=True, timeout=15)
             code = process.returncode
             output.extend(process.stdout)
-        text = output.decode(errors="replace").replace("\r\n", "\n")
+        self.last_output = bytes(output)
+        assert_cursor_visibility(self, output)
+        text = terminal_transcript(output)
         calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()] \
             if (root / "calls.jsonl").exists() else []
-        self.assertNotIn("PRIVATE-KEY-SENTINEL", text)
-        self.assertNotIn("CLIENT-SECRET-SENTINEL", text)
-        self.assertNotIn("ACCESS-TOKEN-SENTINEL", text)
-        self.assertNotIn(KEY, text)
-        self.assertNotIn("LIFECYCLE_STATE_", text)
-        self.assertNotIn("CLUSTER_CONNECTIVITY_", text)
-        self.assertNotIn("CLUSTER_HEALTH_", text)
+        for secret in ("PRIVATE-KEY-SENTINEL", "CLIENT-SECRET-SENTINEL", "ACCESS-TOKEN-SENTINEL",
+                       KEY, "LIFECYCLE_STATE_", "CLUSTER_CONNECTIVITY_", "CLUSTER_HEALTH_"):
+            self.assertNotIn(secret.encode(), output)
+        if env["FAKE_REDRAW"] == "0":
+            self.assertNotIn(b"\x1b", output)
+            self.assertNotIn(b"\r", output.replace(b"\r\n", b"\n"))
         self.assertNotIn("\x1b", text)
         self.assertNotIn("\r", text)
         for process_file in root.glob("ticker-processes-*.json"):
@@ -458,12 +483,13 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("Override both preparation and post-Helm", text)
         self.assertIn("preparation 600s; post-Helm 1800s", text)
 
-    def test_unchanged_status_gets_dots_and_minute_summaries(self):
+    def test_unchanged_status_keeps_one_timed_line(self):
         code, text, _, _ = self.run_installer({"wait_forever": True}, timeout=75)
         self.assertNotEqual(code, 0, text)
         label = "Waiting for Union to confirm the cluster agent installation"
-        self.assertIn(label + " (waiting 0s; no status change observed for 0s)......\n", text)
-        self.assertIn(label + " (waiting 1m; no status change observed for 1m).\nERROR", text)
+        self.assertIn("[1m15s] " + label + ".......\nERROR", text)
+        self.assertEqual(text.count(label), 1)
+        self.assertNotIn("no status change", text)
         self.assertEqual(text.count("Cluster agent: waiting;"), 1)
 
     def test_friendly_phases_distinguish_installation_health_and_readiness(self):
@@ -485,14 +511,15 @@ class InstallerTests(unittest.TestCase):
         positions = [text.index(marker) for marker in markers]
         self.assertEqual(positions, sorted(positions), text)
         for marker in markers[3:6]:
-            self.assertIn(marker + " (waiting 0s;", text)
+            self.assertIn(("[0s] " + marker).encode(), self.last_output)
 
     def test_status_outage_is_distinct_from_unchanged_status_and_recovers(self):
         code, text, _, _ = self.run_installer({"status_failure_attempts": [4, 5, 6]})
         self.assertEqual(code, 0, text)
         self.assertIn("Unable to check installation status. Retrying.", text)
         self.assertIn("Last reported status: Cluster agent: installed;", text)
-        self.assertIn("last status change observed", text)
+        self.assertIn("Waiting for installation status to become available", text)
+        self.assertNotIn("last status change observed", text)
         self.assertIn("Installation status checks are available again.", text)
         self.assertEqual(text.count("Verifying 60 seconds"), 2)
 
@@ -505,7 +532,7 @@ class InstallerTests(unittest.TestCase):
     def test_timeout_closes_redirected_progress_line(self):
         code, text, _, _ = self.run_installer({"wait_forever": True}, timeout=20, buffered_stdout=True)
         self.assertNotEqual(code, 0, text)
-        self.assertTrue(text.endswith("(waiting 0s; no status change observed for 0s).\n"), text)
+        self.assertTrue(text.endswith("[20s] Waiting for Union to confirm the cluster agent installation\n"), text)
 
     def test_unknown_statuses_are_unconfirmed_without_raw_values(self):
         code, text, _, _ = self.run_installer({"status_sequence": [{
@@ -517,25 +544,30 @@ class InstallerTests(unittest.TestCase):
         self.assertNotIn("FUTURE-", text)
         self.assertNotIn("SUCCESS:", text)
 
-    def test_equivalent_enum_encodings_and_activity_timestamps_do_not_reset_status_age(self):
+    def test_equivalent_enum_encodings_and_activity_timestamps_do_not_reset_segment(self):
         string_status = {"agentInstallation": {"state": "LIFECYCLE_STATE_INSTALLING"}}
         numeric_status = {"agentInstallation": {"state": 1, "observedAt": "2030-01-01T00:00:00Z"},
                           "connectivity": 1, "health": 1}
         code, text, _, _ = self.run_installer({"status_sequence": [string_status, numeric_status]}, timeout=75)
         self.assertNotEqual(code, 0, text)
         self.assertEqual(text.count("Cluster agent: installing;"), 1)
-        self.assertIn("waiting 1m; no status change observed for 1m", text)
+        self.assertIn("[1m15s] Waiting for Union to confirm", text)
 
-    def test_helm_has_independent_dots_and_minute_summary(self):
-        code, text, _, _ = self.run_installer({"helm_ticks": 7})
+    def test_helm_redraws_each_second_and_freezes_its_duration(self):
+        code, text, _, _ = self.run_installer({"helm_ticks": 7, "render_each_second": True})
         self.assertEqual(code, 0, text)
-        self.assertIn("Installing the cluster agent (waiting 0s)......\n", text)
-        self.assertIn("Installing the cluster agent (waiting 1m).\nThe cluster agent installation command finished.", text)
+        self.assertIn("[1m10s] Installing the cluster agent.......\nThe cluster agent installation command finished.", text)
+        frames = progress_frames(self.last_output)
+        for second in range(71):
+            duration = f"{second}s" if second < 60 else f"1m{second - 60}s"
+            frame = f"[{duration}] Installing the cluster agent" + "." * (second // 10)
+            self.assertIn(frame.encode(), frames)
+        self.assertEqual(text.count("Installing the cluster agent"), 1)
 
     def test_helm_failure_closes_progress_and_stops_ticker(self):
         code, text, calls, _ = self.run_installer({"helm_ticks": 1, "helm_failure": True})
         self.assertNotEqual(code, 0, text)
-        self.assertIn("Installing the cluster agent (waiting 0s).\nERROR", text)
+        self.assertIn("[10s] Installing the cluster agent.\nERROR", text)
         self.assertNotIn("ApplyDeployment", self.methods(calls))
 
     def test_helm_interruptions_stop_ticker_and_sleeper(self):
@@ -544,13 +576,69 @@ class InstallerTests(unittest.TestCase):
                 code, text, calls, _ = self.run_installer({"helm_hold": True}, interrupt=interrupt)
                 self.assertEqual(code, expected, text)
                 self.assertNotIn("ApplyDeployment", self.methods(calls))
+                self.assertIn("[0s] Installing the cluster agent\nAgent diagnostics", text)
 
     def test_piped_source_preserves_prompts_and_progress_in_redirected_stdout(self):
         code, text, _, _ = self.run_installer({"helm_ticks": 1}, piped_script=True, buffered_stdout=True)
         self.assertEqual(code, 0, text)
         self.assertIn("Is context test-context", text)
-        self.assertIn("Installing the cluster agent (waiting 0s).\n", text)
+        self.assertIn("[0s] Installing the cluster agent\n[10s] Installing the cluster agent\n", text)
         self.assertIn("SUCCESS:", text)
+
+    def test_status_change_starts_a_fresh_segment_with_the_same_label(self):
+        installing = {"state": "LIFECYCLE_STATE_INSTALLING"}
+        code, text, _, _ = self.run_installer({"status_sequence": [
+            {"unionInstallation": installing, "connectivity": 2},
+            {"unionInstallation": installing, "connectivity": 1},
+        ]}, timeout=20)
+        self.assertEqual(code, 1, text)
+        label = "Waiting for Union services to finish installing"
+        self.assertIn("[5s] " + label + "\nCluster agent:", text)
+        self.assertIn("[15s] " + label + ".\nERROR", text)
+        self.assertEqual(progress_frames(self.last_output).count(("[0s] " + label).encode()), 2)
+
+    def test_timer_redraws_while_an_http_request_is_blocked(self):
+        code, text, _, _ = self.run_installer({"instructions_delay": 3, "render_each_second": True})
+        self.assertEqual(code, 0, text)
+        frames = progress_frames(self.last_output)
+        for second in range(4):
+            self.assertIn(f"[{second}s] Waiting for the control plane to prepare agent instructions".encode(), frames)
+        self.assertIn("[3s] Waiting for the control plane to prepare agent instructions\n", text)
+
+    def test_narrow_lines_cycle_dots_without_resetting_elapsed_time(self):
+        code, text, _, _ = self.run_installer({"helm_seconds": 40, "render_each_second": True}, columns=37)
+        self.assertEqual(code, 0, text)
+        frames = progress_frames(self.last_output)
+        self.assertTrue(frames)
+        self.assertTrue(all(len(frame) < 37 for frame in frames))
+        helm = [frame for frame in frames if b"Installing the cluster agent" in frame]
+        self.assertIn(b"[20s] Installing the cluster agent..", helm)
+        self.assertIn(b"[30s] Installing the cluster agent", helm)
+        self.assertIn(b"[40s] Installing the cluster agent.", helm)
+        self.assertTrue(any(b"Waiting for" in frame and frame.endswith(b"...") for frame in frames))
+
+    def test_missing_width_and_dumb_term_use_plain_start_and_end_lines(self):
+        for options in ({"term": "dumb"}, {"stty_error": True}, {"missing_tool": "stty"}):
+            with self.subTest(options=options):
+                code, text, _, _ = self.run_installer({**options, "helm_seconds": 4})
+                self.assertEqual(code, 0, text)
+                self.assertIn("[0s] Installing the cluster agent\n[4s] Installing the cluster agent\n", text)
+
+    def test_resizing_keeps_progress_within_the_new_width(self):
+        resized = False
+
+        def resize(output, fd, root):
+            nonlocal resized
+            if not resized and b"[2s] Installing the cluster agent" in output:
+                fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 30, 0, 0))
+                resized = True
+
+        code, text, _, _ = self.run_installer({"helm_seconds": 10, "render_each_second": True}, action=resize)
+        self.assertEqual(code, 0, text)
+        self.assertTrue(resized)
+        frames = progress_frames(self.last_output)
+        later = frames[frames.index(b"[4s] Installing the clust..."):]
+        self.assertTrue(all(len(frame) < 30 for frame in later))
 
     def test_interruption_cleans_credentials(self):
         code, text, _, _ = self.run_installer({"wait_forever": True}, interrupt=True)

@@ -16,7 +16,7 @@ import termios
 import time
 import unittest
 
-from installer_harness import KEY, ROOT, fixture_environment
+from installer_harness import KEY, ROOT, assert_cursor_visibility, fixture_environment, terminal_transcript
 from preview_install import SCENARIOS, run_terminal
 
 
@@ -101,13 +101,15 @@ class PreviewTests(unittest.TestCase):
                 os.kill(process_id, 0)
         for secret in (KEY, "PRIVATE-KEY-SENTINEL", "CLIENT-SECRET-SENTINEL", "ACCESS-TOKEN-SENTINEL"):
             self.assertNotIn(secret.encode(), output)
+        if command is None:
+            assert_cursor_visibility(self, output)
         return report["code"], bytes(output)
 
     def test_all_scenarios_and_source_modes(self):
         expected = {
             "success": (0, b"SUCCESS:"),
             "existing-agent": (0, b"not currently supported"),
-            "slow": (0, b"Installing the cluster agent (waiting 1m)"),
+            "slow": (0, b"[1m0s] Installing the cluster agent"),
             "helm-failure": (1, b"The agent Helm command failed"),
             "union-failure": (1, b"Union installation has failed"),
             "timeout": (1, b"Timed out after 75 seconds"),
@@ -122,7 +124,7 @@ class PreviewTests(unittest.TestCase):
                     self.assertEqual(output.count(b"[y/N] "), 2 if scenario == "existing-agent" else 1)
                     if scenario == "slow":
                         for phase in (b"prepare agent instructions", b"cluster to connect", b"cluster to report healthy",
-                                      b"cluster agent to become ready", b"Verifying 60 seconds", b"SUCCESS:"):
+                                      b"Waiting for the cluster agent", b"Verifying 60 seconds", b"SUCCESS:"):
                             self.assertIn(phase, output)
                     if expected_code:
                         self.assertNotIn(b"SUCCESS:", output)
@@ -137,13 +139,13 @@ class PreviewTests(unittest.TestCase):
                     self.assertNotIn(b"Installing the cluster agent", output)
                     self.assertEqual(output.count(b"[y/N] "), len(answers))
 
-    def test_automatic_interruption_occurs_after_exactly_two_ticks(self):
+    def test_automatic_interruption_occurs_after_twenty_simulated_seconds(self):
         for source in ("file", "stdin"):
             for speed in (20, 1000):
                 with self.subTest(source=source, speed=speed):
                     code, output = self.run_preview(["interrupt", "--source", source, "--yes", "--speed", str(speed)])
                     self.assertEqual(code, 130, output)
-                    self.assertIn(b"Installing the cluster agent (waiting 0s)..\r\n", output)
+                    self.assertIn("[20s] Installing the cluster agent..\n", terminal_transcript(output))
 
     def test_manual_ctrl_c_and_external_term_restore_terminal(self):
         for source in ("file", "stdin"):
@@ -153,7 +155,7 @@ class PreviewTests(unittest.TestCase):
 
                     def interrupt(output, master, root, pid):
                         nonlocal triggered
-                        if not triggered and b"Installing the cluster agent (waiting 0s)." in output:
+                        if not triggered and b"[10s] Installing the cluster agent." in output:
                             triggered = True
                             if signum == signal.SIGINT:
                                 os.write(master, b"\x03")

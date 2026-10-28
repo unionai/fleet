@@ -15,13 +15,13 @@ python3 tests/preview_install.py success --source stdin --speed 1
 
 Answer confirmations yourself by default; `--yes` supplies affirmative answers
 after prompts appear. Decline a prompt to review cancellation. The default
-simulation speed is 10×: a ten-second progress tick takes about one second plus
+simulation speed is 10×: ten simulated seconds take about one second plus
 command execution time. Use `--speed 1` for normal simulated waiting intervals.
-The existing automated installer tests still advance mock time immediately.
+Operation waits advance the mock clock; renderer sleeps only observe it.
 
 Choose `success`, `existing-agent`, `slow`, `helm-failure`, `union-failure`,
 `timeout`, or `interrupt`. The timeout scenario uses a 75-second simulated wait;
-the interruption scenario sends SIGINT after two Helm progress ticks. Failures
+the interruption scenario sends SIGINT after twenty simulated Helm seconds. Failures
 return status 1, and interruption returns 130. Manual Ctrl-C works in every
 scenario. The tool restores terminal settings and removes its temporary files
 when it exits.
@@ -33,9 +33,13 @@ resizing are forwarded. Rerun the command after editing `install.sh`.
 
 For visual review, check wrapping, prompt placement and answer echo, progress
 line endings, resizing, diagnostics, and terminal restoration after Ctrl-C. The
-current installer appends dots and periodic lines rather than redrawing in place.
-The preview can relay ANSI escapes and carriage returns for future renderer work;
-the current installer tests continue to reject them.
+installer redraws the current progress line once per simulated second, preserving
+its final elapsed duration when a segment finishes. Dots advance every ten seconds
+and restart at the available terminal width. Labels shorten on narrow terminals.
+Each standalone message ends the current segment. The next segment starts at zero.
+The cursor hides during animated progress and returns before messages and handled exits.
+If `stty` cannot read the width or `TERM=dumb`, progress uses plain start/end lines.
+Redirected installer stdout also uses plain start/end lines without redraw bytes.
 
 Run repeatable offline checks with `bash tests/test.sh`, or select another Bash
 with `BASH_BIN=/path/to/bash bash tests/test.sh`. The preview tests run inside an
